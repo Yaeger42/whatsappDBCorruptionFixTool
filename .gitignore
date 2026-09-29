@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+# Keep decrypted messages, encryption keys, and personal backups out of commits.
+*.db
+*.db-*
+*.crypt12
+*.crypt14
+*.crypt15
+*.key
+whatsapp-media-backup/

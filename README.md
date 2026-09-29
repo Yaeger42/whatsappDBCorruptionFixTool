@@ -1,10 +1,10 @@
 # How to Fix the Move to iOS Error When You Transfer WhatsApp from Android to iPhone
 
-This guide solves one specific case: **Move to iOS always fails at the same percentage** during the WhatsApp transfer, and shows *"An unknown error occurred. Please try again later."*
+This guide investigates one reported case: **Move to iOS always fails at the same percentage** during the WhatsApp transfer, and shows *"An unknown error occurred. Please try again later."*
 
-The cause is not the network, the cable, or the app version. The cause is corruption in the WhatsApp database on the Android phone: rows that point to records that no longer exist. The Move to iOS exporter does not handle those references, and it stops.
+Dangling references in the WhatsApp database were the cause in the case behind this guide. A repeated failure percentage alone does not establish that diagnosis; network, storage, software, and other database problems still need to be considered.
 
-The fix is to open the database, delete the dangling rows, and put the database back on the phone.
+The tools below check a decrypted copy, remove a limited set of dangling rows when the checks allow it, and prepare a new encrypted backup. They do not repair physical SQLite corruption or guarantee that WhatsApp will accept a modified backup.
 
 ---
 
@@ -36,7 +36,7 @@ This guide applies when both conditions are true:
 - The transfer fails on the WhatsApp preparing screen or sending screen.
 - It fails **at the same percentage every time**.
 
-A fixed percentage means a deterministic failure. A deterministic failure means one specific record. If the percentage changes on each attempt, your problem is the network or the power, and this guide does not apply.
+A fixed percentage is a useful clue, not proof of a particular bad record. Diagnose a copy before deciding whether this cleanup applies. A changing percentage does not identify the cause either.
 
 ### What Does Not Work
 
@@ -57,10 +57,28 @@ The old Move to iOS version is still worth a try when your failure is different.
 
 - A computer with macOS or Linux.
 - `adb`. On macOS: `brew install android-platform-tools`.
-- Python with [`wa-crypt-tools`](https://github.com/ElDavoo/wa-crypt-tools): `python -m pip install wa-crypt-tools`.
+- Python 3.10 or newer and Git. Install the tested [`wa-crypt-tools`](https://github.com/ElDavoo/wa-crypt-tools) revision using the commands below.
 - `sqlite3`. It comes with macOS and with most Linux distributions.
 - USB debugging turned on, on the Android phone.
-- Free disk space: about three times the size of your WhatsApp backup.
+- Free disk space for the original encrypted backup, decrypted database, temporary snapshot, new encrypted backup, and media. Several times the encrypted backup size may be needed. Encryption also needs memory for the database and compressed buffers.
+- A local output filesystem that supports hard links; outputs are published without overwriting existing files.
+
+---
+
+## Install the tools
+
+Clone the whole repository; the shell entry points need the Python helpers beside them:
+
+```bash
+git clone https://github.com/Yaeger42/whatsappDBCorruptionFixTool.git
+cd whatsappDBCorruptionFixTool
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+umask 077
+```
+
+Keep this environment active for the commands below. The dependency is pinned because repacking uses its header-preserving crypt15 API. Diagnosis and cleanup use Python's standard SQLite library.
 
 ---
 
@@ -111,260 +129,58 @@ If `wadecrypt` fails, delete `encrypted_backup.key` and run `wacreatekey` again.
 
 ## Step 4: Diagnose
 
-Save this as `wa-diagnose.sh`:
-
 ```bash
-#!/usr/bin/env bash
-# wa-diagnose.sh — find corruption in a decrypted WhatsApp msgstore database.
-# Usage: ./wa-diagnose.sh decrypted.db
-set -euo pipefail
-
-DB="${1:?Usage: $0 <decrypted msgstore>}"
-
-echo "=== SQLite integrity ==="
-sqlite3 "$DB" "PRAGMA integrity_check;"
-
-echo
-echo "=== Totals ==="
-sqlite3 -header -column "$DB" "
-SELECT (SELECT COUNT(*) FROM message) AS messages,
-       (SELECT COUNT(*) FROM chat)    AS chats,
-       (SELECT COUNT(*) FROM message_media) AS media_rows;"
-
-echo
-echo "=== Message types (a single NULL here is usually the sentinel row) ==="
-sqlite3 -header -column "$DB" "
-SELECT message_type, COUNT(*) AS n FROM message GROUP BY message_type ORDER BY n DESC LIMIT 15;"
-
-echo
-echo "=== Dangling references (THIS is what breaks Move to iOS) ==="
-sqlite3 -header -column "$DB" "
-SELECT 'messages with no chat' AS problem,
-       COUNT(*) AS n
-FROM message
-WHERE chat_row_id NOT IN (SELECT _id FROM chat) AND key_id <> '-1'
-UNION ALL
-SELECT 'messages with NULL type',
-       COUNT(*)
-FROM message
-WHERE message_type IS NULL AND key_id <> '-1';"
-
-echo
-echo "=== Dangling child rows, table by table ==="
-REPORT="$(mktemp)"
-sqlite3 -noheader "$DB" "
-SELECT 'SELECT ''' || m.name || ''' AS tbl, COUNT(*) AS n FROM \"' || m.name || '\" WHERE ' || p.name || ' > 0 AND ' || p.name || ' NOT IN (SELECT _id FROM message) UNION ALL'
-FROM sqlite_master m
-JOIN pragma_table_info(m.name) p
-WHERE m.type = 'table'
-  AND p.name IN ('message_row_id', 'parent_message_row_id')
-  AND m.name NOT IN ('chat', 'message');" > "$REPORT"
-echo "SELECT 'end' AS tbl, 0 AS n;" >> "$REPORT"
-sqlite3 -noheader -separator '|' "$DB" < "$REPORT" | awk -F'|' '$2 > 0'
-rm -f "$REPORT"
-
-echo
-echo "=== Media: mostly NOISE, read the guide before you worry ==="
-sqlite3 -header -column "$DB" "
-SELECT 'no path' AS field, COUNT(*) AS n FROM message_media WHERE file_path IS NULL OR TRIM(file_path) = ''
-UNION ALL SELECT 'size 0 or null', COUNT(*) FROM message_media WHERE file_size IS NULL OR file_size <= 0
-UNION ALL SELECT 'no mime type', COUNT(*) FROM message_media WHERE mime_type IS NULL OR TRIM(mime_type) = ''
-UNION ALL SELECT 'file_size <> file_length', COUNT(*) FROM message_media WHERE file_size <> file_length
-UNION ALL SELECT 'not transferred', COUNT(*) FROM message_media WHERE transferred = 0;"
+bash wa-diagnose.sh decrypted.db
 ```
 
-Run it:
+This opens the existing file read-only and prints a JSON report. Exit status `0` means the implemented checks passed; `1` means findings or an error, so read the report before continuing.
 
-```bash
-chmod +x wa-diagnose.sh
-./wa-diagnose.sh decrypted.db
-```
+- `integrity` must contain only `ok`. Physical corruption must be handled separately.
+- `bad_messages` counts missing chats or NULL message types, excluding the documented sentinel (`_id=1`, `chat_row_id=-1`, `key_id='-1'`, NULL type).
+- `orphan_children` counts positive `message_row_id` and `parent_message_row_id` references with no matching message.
+- `dangling_chat_pointers` reports positive chat pointers ending in `_message_row_id` that have no target.
+- `foreign_key_errors` reports violations of declared foreign keys. Many WhatsApp relationships are implicit, so this is not a complete relationship check.
 
-### How to Read the Output
+The supported schema requires `message`, `chat`, and `message_media`, with integer primary keys on `message._id` and `chat._id`. Databases missing the required tables or columns are rejected. The tools have automated synthetic tests, but no claim of compatibility with every WhatsApp version or a completed device migration.
 
-**What matters.** The dangling references block and the child rows block. Any number above zero there is real corruption. In my case there were 113 system messages that pointed to chats that no longer existed, plus 847 rows across seven tables:
-
-```
-message_text|11
-message_thumbnail|140
-message_media_interactive_annotation|13
-message_secret|276
-template_messages_metadata|75
-message_media|331
-message_inline_video_metadata|1
-```
-
-**What is noise.** Almost the whole media block:
-
-| Signal | Why this is not corruption |
-|---|---|
-| `message_type` NULL with 1 row | This is the sentinel row that WhatsApp creates in every database. You recognize it by `_id = 1`, `chat_row_id = -1`, `key_id = '-1'`. Normal. |
-| `no path` and `not transferred` | Media that you never downloaded, or that you deleted from disk. WhatsApp keeps the row. Normal. |
-| `size 0 or null` and `file_size <> file_length` | Current schemas barely use `file_size`. The real value is in `file_length`. Normal. |
-| `no mime type` | Many sent images store an empty `mime_type`. Normal. |
-
-In my database those four signals added up to more than 100,000 rows. None of them had a part in the failure.
-
-**Broken files on disk.** Also look for zero-byte media, because those do stall the transfer:
-
-```bash
-adb shell 'find /sdcard/Android/media/com.whatsapp/WhatsApp/Media -type f -size 0'
-```
-
-Ignore the `.nomedia` files: they are empty markers by design. Delete any other zero-byte file.
+Missing media paths, empty MIME types, or undownloaded attachments are not by themselves reasons to delete a message. These tools do not remove media files.
 
 ---
 
 ## Step 5: Clean the Database
 
-Save this as `wa-clean.sh`:
+Preview the cleanup on a temporary copy first:
 
 ```bash
-#!/usr/bin/env bash
-# wa-clean.sh — delete dangling references from a decrypted msgstore database.
-# Usage: ./wa-clean.sh decrypted.db work.db
-set -euo pipefail
-
-SRC="${1:?Usage: $0 <decrypted msgstore> <output>}"
-DST="${2:?Usage: $0 <decrypted msgstore> <output>}"
-
-cp "$SRC" "$DST"
-
-BEFORE="$(sqlite3 "$DST" 'SELECT COUNT(*) FROM message;')"
-echo "Messages before: $BEFORE"
-
-# 1. Mark the messages whose chat no longer exists.
-sqlite3 "$DST" "
-DROP TABLE IF EXISTS bad_msgs;
-CREATE TABLE bad_msgs AS
-SELECT _id FROM message
-WHERE (chat_row_id NOT IN (SELECT _id FROM chat) OR message_type IS NULL)
-  AND key_id <> '-1';"
-
-BAD="$(sqlite3 "$DST" 'SELECT COUNT(*) FROM bad_msgs;')"
-echo "Messages to delete: $BAD"
-
-if [ "$BAD" = "0" ]; then
-  echo "Nothing to clean for this pattern."
-fi
-
-CLEAN="cleanup.sql"
-: > "$CLEAN"
-
-# 2. Delete the child rows of those messages.
-sqlite3 -noheader "$DST" "
-SELECT 'DELETE FROM \"' || m.name || '\" WHERE ' || p.name || ' IN (SELECT _id FROM bad_msgs);'
-FROM sqlite_master m
-JOIN pragma_table_info(m.name) p
-WHERE m.type = 'table'
-  AND p.name IN ('message_row_id', 'parent_message_row_id')
-  AND m.name NOT IN ('chat', 'message', 'bad_msgs');" >> "$CLEAN"
-
-# 3. Delete the messages.
-echo 'DELETE FROM message WHERE _id IN (SELECT _id FROM bad_msgs);' >> "$CLEAN"
-
-# 4. General sweep: any child row that points to a message that does not exist.
-sqlite3 -noheader "$DST" "
-SELECT 'DELETE FROM \"' || m.name || '\" WHERE ' || p.name || ' > 0 AND ' || p.name || ' NOT IN (SELECT _id FROM message);'
-FROM sqlite_master m
-JOIN pragma_table_info(m.name) p
-WHERE m.type = 'table'
-  AND p.name IN ('message_row_id', 'parent_message_row_id')
-  AND m.name NOT IN ('chat', 'message', 'bad_msgs');" >> "$CLEAN"
-
-echo 'DROP TABLE bad_msgs;' >> "$CLEAN"
-
-# 5. Safety control: never touch the chat table.
-if grep -q 'DELETE FROM "chat"' "$CLEAN"; then
-  echo "ABORTED: the script generated a DELETE against the chat table." >&2
-  exit 1
-fi
-
-echo "Statements generated: $(grep -c DELETE "$CLEAN")"
-
-# 6. Apply.
-sqlite3 "$DST" < "$CLEAN"
-
-# 7. Verify.
-echo
-echo "=== Verification ==="
-sqlite3 -header -column "$DST" "
-SELECT (SELECT COUNT(*) FROM message WHERE chat_row_id NOT IN (SELECT _id FROM chat) AND key_id <> '-1') AS orphan_msgs,
-       (SELECT COUNT(*) FROM message_media WHERE message_row_id NOT IN (SELECT _id FROM message)) AS orphan_media,
-       (SELECT COUNT(*) FROM message) AS messages_now;"
-sqlite3 "$DST" "PRAGMA integrity_check;"
-
-AFTER="$(sqlite3 "$DST" 'SELECT COUNT(*) FROM message;')"
-echo "Messages: $BEFORE -> $AFTER (difference: $((BEFORE - AFTER)))"
-
-sqlite3 "$DST" "VACUUM;"
-echo "Done: $DST"
+bash wa-clean.sh decrypted.db --dry-run
 ```
 
-Run it:
+Then create a new output:
 
 ```bash
-chmod +x wa-clean.sh
-./wa-clean.sh decrypted.db work.db
+bash wa-clean.sh decrypted.db work.db
+bash wa-diagnose.sh work.db
 ```
 
-You want to see `0`, `0`, `ok`, and a message difference equal to the number that the script announced as "to delete". Run `wa-diagnose.sh` again on `work.db`: the dangling child rows block must come out empty.
+Use a new output filename on each attempt. Existing files and symlinks are rejected. The SQLite backup API includes committed WAL contents; the original is not edited. Cleanup runs in a transaction on a private temporary copy, checks its results, then publishes a file with owner-only permissions. A failed run publishes no output.
 
-The script never touches the `chat` table. That table holds columns such as `last_message_row_id`, so it appears in searches by column name. A delete against it destroys your conversations.
+**If a selected message is still referenced by a chat pointer, cleanup stops.** The tool does not guess a replacement message, delete the chat, or silently leave a dangling pointer. Investigate that schema and relationship before proceeding. Pre-existing dangling chat pointers also prevent a successful result.
+
+Successful checks cover the relationships listed above, not every possible WhatsApp invariant. Keep the original encrypted backup and your media copy.
 
 ---
 
 ## Step 6: Encrypt Again and Verify
 
-Save this as `wa-repack.sh`:
-
 ```bash
-#!/usr/bin/env bash
-# wa-repack.sh — encrypt a cleaned database and verify the result.
-# Usage: ./wa-repack.sh encrypted_backup.key work.db msgstore.ORIGINAL.crypt15 msgstore.NEW.crypt15
-set -euo pipefail
-
-KEY="${1:?}"
-PLAIN="${2:?}"
-REF="${3:?}"
-OUT="${4:?}"
-
-rm -f "$OUT" roundtrip.db
-
-# --reference copies the IV, the header, and the compression level from the real backup.
-waencrypt --reference "$REF" "$KEY" "$PLAIN" "$OUT"
-
-echo
-echo "=== Headers: these must be identical ==="
-wainfo "$REF"
-wainfo "$OUT"
-
-echo
-echo "=== Round trip ==="
-wadecrypt "$KEY" "$OUT" roundtrip.db
-
-if cmp -s "$PLAIN" roundtrip.db; then
-  echo "OK: the encrypted file decrypts to exactly $PLAIN"
-else
-  echo "FAILED: the decrypted output does not match. Do not use $OUT." >&2
-  exit 1
-fi
-
-ls -l "$REF" "$OUT"
+bash wa-repack.sh encrypted_backup.key work.db msgstore.ORIGINAL.crypt15 msgstore.NEW.crypt15
 ```
 
-Run it:
+The tool authenticates the original crypt15 backup, takes a consistent SQLite snapshot of the cleaned database, and encrypts it with a **fresh random IV**. It preserves the reference header metadata, including unknown protobuf fields, and checks that only the IV changed. Never reuse an AES-GCM IV with the same key for different contents.
 
-```bash
-chmod +x wa-repack.sh
-./wa-repack.sh encrypted_backup.key work.db msgstore.ORIGINAL.crypt15 msgstore.NEW.crypt15
-```
+Verification authenticates and decompresses the new file and compares the resulting snapshot's length and SHA-256 digest. SQLite's backup API may normalize header counters, so the snapshot need not be byte-identical to the input file even when its data is unchanged. No plaintext `roundtrip.db` is left behind; private temporary files are removed on normal completion or a handled failure. Existing outputs are never overwritten.
 
-Two notes about the result.
-
-`wainfo` prints header fields only, and it does not include the file size. Two identical outputs, with the same IV, are exactly what you want: `--reference` reproduced the phone header byte for byte.
-
-**The new file can come out larger than the original.** Mine went from 182 MB to 190 MB, even after I deleted rows. `VACUUM` repacks the SQLite pages, and that changes how well zlib compresses them. This is not a symptom of anything. The round trip check is what decides.
+**This is local verification, not proof that WhatsApp can restore the backup.** Retain all recovery copies until chats and media have been checked on the destination phone. An encrypted file's size can change after cleanup and compression; size alone does not establish correctness.
 
 ---
 
@@ -372,13 +188,16 @@ Two notes about the result.
 
 Move to iOS does **not** read the `.crypt15` file. It reads the live database, at `/data/data/com.whatsapp/databases/msgstore.db`, which you cannot reach without root. So you must make WhatsApp restore your file.
 
-### 7a. Delete the Google Drive Backup
+### 7a. Keep a recovery path
 
-WhatsApp prefers the cloud. While a Drive backup exists, WhatsApp never offers you the local one.
+**Do not delete the Google Drive backup or hidden app data to try this procedure.** A local round trip is not a restore test.
 
-1. In WhatsApp: **Settings > Chats > Chat backup > Automatic backups > Off**.
-2. In the Google Drive app: menu > **Backups** > the three-dot menu next to WhatsApp > **Delete backup**.
-3. Optional and recommended, from `drive.google.com`: gear > Settings > **Manage apps** > WhatsApp Messenger > Options > **Disconnect from Drive** and **Delete hidden app data**.
+1. Turn off automatic WhatsApp backups temporarily so a failed attempt cannot replace a useful backup.
+2. Keep the original encrypted file and key off the phone. Confirm the media copy completed, inspect its files, and compare file counts and sizes with the phone before clearing app data. Keep a second independent copy if possible.
+3. During setup, skip the Google account backup search when that option is offered. If your version offers a reversible way to disconnect Drive without deleting its backup or data, that can be used temporarily.
+4. If WhatsApp still will not offer the local backup, stop. Do not delete the remote backup to force it; first establish a recovery procedure for that app version.
+
+Do not continue to `pm clear` unless you have verified the off-device copies and have a way back if the local restore fails.
 
 ### 7b. Move the Other Backups Aside
 
@@ -476,9 +295,9 @@ Do not delete WhatsApp from the Android phone until you see the complete chats o
 
 ## If It Fails Again
 
-**At the same exact percentage.** The corruption was something else. Go back to `wa-diagnose.sh` and look for other patterns. The database is already decrypted and you can query whatever you want.
+**At the same exact percentage.** The cause is still unresolved. Go back to the diagnostic report and investigate other causes before deleting more data.
 
-**At a different percentage.** This is a good sign. The exporter moved past the record that stalled it, and there is another one to clean. Repeat the cycle.
+**At a different percentage.** The failure changed, but that does not prove another record needs deleting. Investigate before repeating cleanup.
 
 **With the same error but at 0%.** That is a different failure. There, the WhatsApp beta and Move to iOS 3.5.0 are worth a try.
 
@@ -532,4 +351,15 @@ Set up both layers the same day. Do not leave this for later:
 
 ## Disclaimer
 
-This guide modifies the WhatsApp database. WhatsApp supports none of this. The scripts always work on copies and verify the result before anything goes back to the phone, but the responsibility is yours. Back up the media folder before you start, save the 64-digit key, and keep your Drive backup until the round trip check in Step 6 passes.
+This guide modifies the WhatsApp database. WhatsApp supports none of this. The scripts always work on copies and verify the result before anything goes back to the phone, but the responsibility is yours. Back up the media folder before you start, save the 64-digit key, and keep your Drive backup until the destination chats and media have been verified; a local round trip alone does not establish restorability.
+
+
+## Development
+
+Run the regression suite after installing `requirements.txt`:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Tests generate disposable databases and keys. They cover output collisions, failed cleanup, WAL snapshots, chat-pointer refusal, integrity checks, and authenticated crypt15 round trips with fresh IVs and preserved metadata. Run them locally with the command above. Device restore testing remains a separate step.
