@@ -199,25 +199,47 @@ class RecoveryTests(DatabaseFixture):
         self.assertIn("integrity check failed", result.stderr)
         self.assertFalse(self.output.exists())
     
-    def test_regression_in_unrepaired_counters_blocks_output(self):
+    def test_regressions_compare_identities_not_counts(self):
         baseline = {
-            "integrity": ["ok"],
-            "foreign_key_errors": 1,
-            "orphan_children": {"message_media": 0},
-            "dangling_chat_pointers": {"last_message_row_id": 1},
+            "dangling_chat_pointers": {("last_message_row_id", 20, 999)},
+            "foreign_key_errors": set(),
         }
-        worse = dict(baseline, foreign_key_errors=2)
+        unchanged = {group: set(rows) for group, rows in baseline.items()}
+        self.assertEqual(wa_db.regressions(baseline, unchanged), {})
+        # Same count, different chat: a swap is a regression, not a survivor.
+        swapped = {
+            "dangling_chat_pointers": {("last_message_row_id", 10, 2)},
+            "foreign_key_errors": set(),
+        }
         self.assertEqual(
-            wa_db.regressions(baseline, worse), {"foreign_key_errors": [1, 2]}
+            wa_db.regressions(baseline, swapped),
+            {"dangling_chat_pointers": [["last_message_row_id", 10, 2]]},
         )
-        self.assertEqual(wa_db.regressions(baseline, baseline), {})
-        # An accepted pre-existing count is not a regression, a new one is.
-        self.assertEqual(
-            wa_db.regressions(
-                baseline, dict(baseline, orphan_children={"message_media": 3})
-            ),
-            {"orphan_children": {"message_media": [0, 3]}},
+
+    def test_allow_preexisting_refuses_a_swapped_finding(self):
+        # One dangling pointer is repaired while another appears, so the count
+        # never moves. Triggers only make this reachable in a fixture; the point
+        # is the validation guarantee, not WhatsApp behavior.
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.executescript("""
+                UPDATE chat SET display_message_row_id=NULL WHERE _id=10;
+                INSERT INTO chat VALUES (20, 999, NULL);
+                CREATE TRIGGER swap AFTER DELETE ON message WHEN OLD._id = 3
+                BEGIN
+                    INSERT OR IGNORE INTO message VALUES (999, 10, 0, 'appeared');
+                    DELETE FROM message WHERE _id = 2;
+                END;
+            """)
+        before = digest(self.source)
+        result = self.run_tool(
+            "wa-clean.sh", self.source, self.output, "--allow-preexisting"
         )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("new unrepaired findings", result.stderr)
+        self.assertIn("last_message_row_id", result.stderr)
+        self.assertFalse(self.output.exists())
+        self.assertEqual(digest(self.source), before)
+        self.assertEqual(list(self.directory.glob(".wa-*")), [])
 
 
     def test_integrity_failure_is_not_success(self):
