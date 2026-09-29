@@ -223,20 +223,13 @@ Move to iOS does **not** read the `.crypt15` file. It reads the live database, a
 
 ### 7a. Keep a recovery path
 
-A local round trip is not a restore test. Build your fallbacks before you clear app data.
+A local round trip is not a restore test. Copying the files and comparing their sizes proves that you have copies. It does not prove that any copy restores on a phone.
 
 1. Turn off automatic WhatsApp backups, so that a failed attempt cannot replace a useful backup.
 2. Keep the original encrypted file and the key off the phone. Confirm that the media copy completed, inspect its files, and compare file counts and sizes against the phone. Keep a second independent copy if you can.
-3. During setup, skip the Google account backup search when that option is offered. Try this first, because WhatsApp cannot read a Drive backup that it has no permission to search.
+3. During setup, skip the Google account backup search when that option is offered. WhatsApp cannot read a Drive backup that it has no permission to search.
 
-**If WhatsApp still does not offer the local backup, the Drive backup is what hides it.** WhatsApp prefers the cloud copy. In the one case behind this guide, the local restore appeared only after the Drive backup was deleted and WhatsApp was disconnected from Drive.
-
-> **CAUTION:** Delete the Drive backup only after step 2 above is complete and verified. You cannot download a Drive backup, so it is not a copy that you can inspect. Your computer copies are.
-
-- In the Google Drive app: menu > **Backups** > the three-dot menu next to WhatsApp > **Delete backup**.
-- From `drive.google.com`: gear > Settings > **Manage apps** > WhatsApp Messenger > Options > **Disconnect from Drive**.
-
-Do not continue to `pm clear` unless you have verified the off-device copies and have a way back if the local restore fails.
+Do not continue to `pm clear` until the off-device copies are verified, and until you accept that the local restore can still fail.
 
 ### 7b. Move the Other Backups Aside
 
@@ -277,7 +270,7 @@ The output must show one file, with the size of your `msgstore.NEW.crypt15` and 
 
 On the phone:
 
-1. Open WhatsApp and verify your phone number.
+1. Open WhatsApp and verify your phone number. Use the number that made the backup.
 2. When WhatsApp asks for permission to search your Google account for backups, tap **Skip**. Permission links Drive again.
 3. If the screen about a transfer from your old phone appears, decline it with the secondary option.
 4. When WhatsApp offers the local backup, tap restore.
@@ -285,7 +278,22 @@ On the phone:
 
 You restore nothing by hand. WhatsApp reads the file that you put in place.
 
-If WhatsApp takes you straight to the name and photo screen with no backup offer, complete nothing. Check the file owner, and check that the `Databases` folder holds one `.crypt15` file only.
+### 7e. If WhatsApp offers no backup
+
+Complete nothing on the name and photo screen. Work through these first, because all five are free and reversible:
+
+1. Check the file owner from step 7c. WhatsApp cannot read a file owned by `shell`.
+2. Check that `Databases` holds exactly one file, your `.crypt15`. Dated copies and `msgstore-increment.db.crypt15` compete with it.
+3. Check that WhatsApp created `Android/media/com.whatsapp` itself after `pm clear`, before you pushed the file. A folder created by `adb` can carry ownership that WhatsApp cannot use.
+4. Check that the number you verified is the number that made the backup.
+5. Check that WhatsApp holds the files and media permission.
+
+If all five hold and WhatsApp still offers nothing, one more thing is known to change the outcome, and it is the only irreversible item here. In the single case behind this guide, the local restore appeared after the Drive backup was deleted and WhatsApp was disconnected from Drive. That is one report. It is not established as the general cause.
+
+> **CAUTION:** A Drive backup cannot be downloaded or inspected, and deleting it cannot be undone. If the local restore then fails as well, that copy is gone. Decide this with your verified computer copies in front of you.
+
+- In the Google Drive app: menu > **Backups** > the three-dot menu next to WhatsApp > **Delete backup**.
+- From `drive.google.com`: gear > Settings > **Manage apps** > WhatsApp Messenger > Options > **Disconnect from Drive**.
 
 ---
 
