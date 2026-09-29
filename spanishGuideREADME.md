@@ -223,20 +223,13 @@ Move to iOS **no** lee el archivo `.crypt15`. Lee la base viva, en `/data/data/c
 
 ### 7a. Conserva una vía de recuperación
 
-Una comprobación local de cifrado y descifrado no es una prueba de restauración. Construye tus respaldos antes de borrar los datos de la app.
+Una comprobación local de cifrado y descifrado no es una prueba de restauración. Copiar los archivos y comparar sus tamaños demuestra que tienes copias. No demuestra que alguna copia restaure en un teléfono.
 
 1. Desactiva las copias automáticas de WhatsApp, para que un intento fallido no reemplace una copia útil.
 2. Conserva el archivo cifrado original y su clave fuera del teléfono. Comprueba que la copia multimedia terminó, revisa sus archivos y compara cantidades y tamaños con el teléfono. Guarda otra copia independiente si puedes.
-3. Omite la búsqueda de respaldos de Google durante la configuración cuando aparezca esa opción. Prueba esto primero, porque WhatsApp no puede leer una copia de Drive que no tiene permiso para buscar.
+3. Omite la búsqueda de respaldos de Google durante la configuración cuando aparezca esa opción. WhatsApp no puede leer una copia de Drive que no tiene permiso para buscar.
 
-**Si WhatsApp sigue sin ofrecer la copia local, la copia de Drive es lo que la oculta.** WhatsApp prefiere la copia de la nube. En el único caso que dio origen a esta guía, la restauración local apareció solo después de borrar la copia de Drive y desconectar WhatsApp de Drive.
-
-> **PRECAUCIÓN:** Borra la copia de Drive solo cuando el punto 2 de arriba esté completo y verificado. Una copia de Drive no se puede descargar, así que no es una copia que puedas inspeccionar. Las de tu computadora sí.
-
-- En la app de Google Drive: menú > **Copias de seguridad** > los tres puntos junto a WhatsApp > **Eliminar copia de seguridad**.
-- Desde `drive.google.com`: engranaje > Configuración > **Administrar aplicaciones** > WhatsApp Messenger > Opciones > **Desconectar de Drive**.
-
-No ejecutes `pm clear` sin verificar las copias fuera del dispositivo y tener una forma de volver atrás si falla la restauración local.
+No ejecutes `pm clear` hasta verificar las copias fuera del dispositivo, y hasta aceptar que la restauración local puede fallar de todos modos.
 
 ### 7b. Aparta las otras copias del teléfono
 
@@ -276,8 +269,7 @@ Debe mostrar un solo archivo, con el tamaño de tu `msgstore.NEW.crypt15` y due�
 ### 7d. Restaura
 
 En el teléfono:
-
-1. Abre WhatsApp y verifica tu número.
+1. Abre WhatsApp y verifica tu número. Usa el número que hizo la copia.
 2. Cuando pida permiso para buscar copias en tu cuenta de Google, pulsa **Omitir**. Concederlo volvería a vincular Drive.
 3. Si aparece la pantalla de transferir desde el teléfono anterior, recházala con la opción secundaria.
 4. Cuando ofrezca la copia local, pulsa restaurar.
@@ -285,8 +277,22 @@ En el teléfono:
 
 No necesitas restaurar nada a mano. WhatsApp lee el archivo que colocaste.
 
-Si te lleva directo a poner nombre y foto sin ofrecer ninguna copia, no completes nada. Revisa el dueño del archivo y que la carpeta `Databases` tenga un solo `.crypt15`.
+### 7e. Si WhatsApp no ofrece ninguna copia
 
+No completes nada en la pantalla de nombre y foto. Revisa primero estos cinco puntos, porque todos son gratis y reversibles:
+
+1. Revisa el dueño del archivo del paso 7c. WhatsApp no puede leer un archivo cuyo dueño es `shell`.
+2. Revisa que `Databases` tenga exactamente un archivo, tu `.crypt15`. Las copias con fecha y `msgstore-increment.db.crypt15` compiten con él.
+3. Revisa que WhatsApp creara `Android/media/com.whatsapp` por sí mismo después del `pm clear`, antes de que empujaras el archivo. Una carpeta creada por `adb` puede quedar con permisos que WhatsApp no puede usar.
+4. Revisa que el número que verificaste sea el número que hizo la copia.
+5. Revisa que WhatsApp tenga el permiso de archivos y multimedia.
+
+Si los cinco están bien y WhatsApp sigue sin ofrecer nada, hay una cosa más que se sabe que cambia el resultado, y es la única irreversible de esta lista. En el único caso que dio origen a esta guía, la restauración local apareció después de borrar la copia de Drive y desconectar WhatsApp de Drive. Ese es un solo reporte. No está establecido como la causa general.
+
+> **PRECAUCIÓN:** Una copia de Drive no se puede descargar ni inspeccionar, y su borrado no se puede deshacer. Si la restauración local también falla, esa copia ya no vuelve. Decide esto con tus copias de la computadora verificadas delante.
+
+- En la app de Google Drive: menú > **Copias de seguridad** > los tres puntos junto a WhatsApp > **Eliminar copia de seguridad**.
+- Desde `drive.google.com`: engranaje > Configuración > **Administrar aplicaciones** > WhatsApp Messenger > Opciones > **Desconectar de Drive**.
 ---
 
 ## Paso 8: recupera multimedia antes de transferir
