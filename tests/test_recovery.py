@@ -212,6 +212,21 @@ class RecoveryTests(DatabaseFixture):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(missing.exists())
 
+    def test_readonly_uri_handles_special_characters_and_rejects_writes(self):
+        source = self.directory / "chat #?& ü.db"
+        self.source.rename(source)
+        before = digest(source)
+        with closing(wa_db.open_readonly(source)) as connection:
+            connection.execute("PRAGMA query_only=OFF")
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM message").fetchone(), (3,)
+            )
+            with self.assertRaises(sqlite3.OperationalError):
+                connection.execute("DELETE FROM message")
+        self.assertEqual(digest(source), before)
+        result = self.run_tool("wa-clean.sh", source, self.output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_diagnose_reports_findings_and_healthy_result(self):
         before = digest(self.source)
         result = self.run_tool("wa-diagnose.sh", self.source)

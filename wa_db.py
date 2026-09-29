@@ -51,7 +51,7 @@ def publish(staged, destination):
 
 def open_readonly(path):
     connection = sqlite3.connect(
-        input_file(path).as_uri() + "?mode=ro", isolation_level=None
+        input_file(path).as_uri() + "?mode=ro", uri=True, isolation_level=None
     )
     connection.execute("PRAGMA query_only=ON")
     return connection
