@@ -189,19 +189,36 @@ def healthy(result):
     return not findings(result)
 
 
+def unrepaired_entries(connection):
+    """Identify each unrepaired finding, not just how many there are.
+
+    Counts alone cannot tell a finding that survived from one that replaced it:
+    a run that repairs one dangling pointer and breaks another leaves the count
+    unchanged. Only the relaxable findings need this, because orphan child rows
+    and bad messages must be zero whatever the caller allows.
+    """
+    _, chat_refs = schema(connection)
+    return {
+        "dangling_chat_pointers": {
+            (ref, chat_id, target)
+            for ref in chat_refs
+            for chat_id, target in connection.execute(
+                f"SELECT _id, {identifier(ref)} FROM chat WHERE {orphan_condition([ref])}"
+            )
+        },
+        "foreign_key_errors": {
+            tuple(row) for row in connection.execute("PRAGMA foreign_key_check")
+        },
+    }
+
+
 def regressions(baseline, result):
-    """Counters that this run made worse. These block even with --allow-preexisting."""
+    """Findings this run introduced. These block even with --allow-preexisting."""
     worse = {}
-    if result["foreign_key_errors"] > baseline["foreign_key_errors"]:
-        worse["foreign_key_errors"] = [
-            baseline["foreign_key_errors"],
-            result["foreign_key_errors"],
-        ]
-    for group in ("orphan_children", "dangling_chat_pointers"):
-        for name, count in result[group].items():
-            was = baseline[group].get(name, 0)
-            if count > was:
-                worse.setdefault(group, {})[name] = [was, count]
+    for group in ("dangling_chat_pointers", "foreign_key_errors"):
+        added = result[group] - baseline[group]
+        if added:
+            worse[group] = [list(entry) for entry in sorted(added, key=repr)]
     return worse
 
 
@@ -215,10 +232,11 @@ def require_integrity(result):
 def require_healthy(connection, allow_preexisting=False, baseline=None):
     result = report(connection)
     if baseline is not None:
-        worse = regressions(baseline, result)
+        worse = regressions(baseline, unrepaired_entries(connection))
         if worse:
             raise RecoveryError(
-                "Cleanup made the database worse; refusing output: " + json.dumps(worse)
+                "Cleanup introduced new unrepaired findings; refusing output: "
+                + json.dumps(worse)
             )
     problems = findings(result, allow_preexisting)
     if problems:
@@ -253,8 +271,8 @@ def clean(source, destination=None, dry_run=False, allow_preexisting=False):
         with closing(sqlite3.connect(staged, isolation_level=None)) as connection:
             # Record the input state so the checks below can tell a problem that
             # cleanup introduced from one that was already there.
-            baseline = report(connection)
-            require_integrity(baseline)
+            require_integrity(report(connection))
+            baseline = unrepaired_entries(connection)
             children, chat_refs = schema(connection)
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("BEGIN IMMEDIATE")
