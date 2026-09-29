@@ -153,6 +153,94 @@ class RecoveryTests(DatabaseFixture):
         self.assert_refused(
             "UPDATE chat SET display_message_row_id=999;", "Database checks failed"
         )
+        
+    def test_sentinel_with_other_rowid_is_preserved(self):
+    # Nothing in the schema pins the sentinel to _id=1.
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.executescript("UPDATE message SET _id=5 WHERE _id=1;")
+        result = self.run_tool("wa-clean.sh", self.source, self.output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(rows(self.output, "SELECT _id FROM message"), [(2,), (5,)])
+
+    def test_allow_preexisting_publishes_without_repairing(self):
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.executescript(
+                "UPDATE chat SET display_message_row_id=999;"
+                "CREATE TABLE dependent(chat_id REFERENCES chat(_id));"
+                "INSERT INTO dependent VALUES(999);"
+            )
+        before = digest(self.source)
+        refused = self.run_tool("wa-clean.sh", self.source, self.output)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("--allow-preexisting", refused.stderr)
+        self.assertFalse(self.output.exists())
+        result = self.run_tool(
+            "wa-clean.sh", self.source, self.output, "--allow-preexisting"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Accepted pre-existing findings", result.stdout)
+        self.assertEqual(rows(self.output, "SELECT _id FROM message"), [(1,), (2,)])
+        self.assertEqual(
+            rows(self.output, "SELECT display_message_row_id FROM chat"), [(999,)]
+        )
+        self.assertEqual(digest(self.source), before)
+    
+    def test_allow_preexisting_does_not_relax_integrity(self):
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.executescript(
+                "CREATE TABLE checked(n INTEGER CHECK(n>0));"
+                "PRAGMA ignore_check_constraints=ON;"
+                "INSERT INTO checked VALUES(-1);"
+            )
+        result = self.run_tool(
+            "wa-clean.sh", self.source, self.output, "--allow-preexisting"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("integrity check failed", result.stderr)
+        self.assertFalse(self.output.exists())
+    
+    def test_regressions_compare_identities_not_counts(self):
+        baseline = {
+            "dangling_chat_pointers": {("last_message_row_id", 20, 999)},
+            "foreign_key_errors": set(),
+        }
+        unchanged = {group: set(rows) for group, rows in baseline.items()}
+        self.assertEqual(wa_db.regressions(baseline, unchanged), {})
+        # Same count, different chat: a swap is a regression, not a survivor.
+        swapped = {
+            "dangling_chat_pointers": {("last_message_row_id", 10, 2)},
+            "foreign_key_errors": set(),
+        }
+        self.assertEqual(
+            wa_db.regressions(baseline, swapped),
+            {"dangling_chat_pointers": [["last_message_row_id", 10, 2]]},
+        )
+
+    def test_allow_preexisting_refuses_a_swapped_finding(self):
+        # One dangling pointer is repaired while another appears, so the count
+        # never moves. Triggers only make this reachable in a fixture; the point
+        # is the validation guarantee, not WhatsApp behavior.
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.executescript("""
+                UPDATE chat SET display_message_row_id=NULL WHERE _id=10;
+                INSERT INTO chat VALUES (20, 999, NULL);
+                CREATE TRIGGER swap AFTER DELETE ON message WHEN OLD._id = 3
+                BEGIN
+                    INSERT OR IGNORE INTO message VALUES (999, 10, 0, 'appeared');
+                    DELETE FROM message WHERE _id = 2;
+                END;
+            """)
+        before = digest(self.source)
+        result = self.run_tool(
+            "wa-clean.sh", self.source, self.output, "--allow-preexisting"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("new unrepaired findings", result.stderr)
+        self.assertIn("last_message_row_id", result.stderr)
+        self.assertFalse(self.output.exists())
+        self.assertEqual(digest(self.source), before)
+        self.assertEqual(list(self.directory.glob(".wa-*")), [])
+
 
     def test_integrity_failure_is_not_success(self):
         self.assert_refused(
@@ -357,6 +445,35 @@ class RepackTests(DatabaseFixture):
         self.assertIn("Database checks failed", result.stderr)
         self.assertFalse(self.output.exists())
         self.assertEqual(list(self.directory.glob(".wa-*")), [])
+        
+    def test_repack_matches_the_cleanup_decision_on_preexisting_findings(self):
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.executescript("UPDATE chat SET display_message_row_id=999;")
+        relaxed = self.directory / "relaxed.db"
+        self.assertEqual(
+            self.run_tool(
+                "wa-clean.sh", self.source, relaxed, "--allow-preexisting"
+            ).returncode,
+            0,
+        )
+        output = self.directory / "relaxed.crypt15"
+        refused = self.run_tool(
+            "wa-repack.sh", self.key_path, relaxed, self.reference, output
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("Database checks failed", refused.stderr)
+        self.assertFalse(output.exists())
+        result = self.run_tool(
+            "wa-repack.sh",
+            self.key_path,
+            relaxed,
+            self.reference,
+            output,
+            "--allow-preexisting",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(output.exists())
+
 
     def test_failed_roundtrip_is_not_published(self):
         # Damage the newly written encrypted file as the verifier opens it.

@@ -21,7 +21,7 @@ from wa_db import (
 )
 
 
-def repack(key_path, plain_path, reference_path, destination):
+def repack(key_path, plain_path, reference_path, destination, allow_preexisting=False):
     # These APIs are tied to the revision in requirements.txt. The CLI's --reference
     # option reuses the reference IV, even if --iv is also supplied.
     from wa_crypt_tools.lib.constants import C
@@ -59,7 +59,7 @@ def repack(key_path, plain_path, reference_path, destination):
             encrypted = Path(directory) / "backup.crypt15"
             snapshot(plain_path, plain)
             with closing(open_readonly(plain)) as connection:
-                require_healthy(connection)
+                require_healthy(connection, allow_preexisting)
             data = plain.read_bytes()
             size = len(data)
             digest = hashlib.sha256(data).digest()
@@ -115,9 +115,20 @@ def main():
     parser.add_argument("plain")
     parser.add_argument("reference")
     parser.add_argument("output")
+    parser.add_argument(
+        "--allow-preexisting",
+        action="store_true",
+        help="Accept the same unrepaired findings that wa-clean.sh accepted.",
+    )
     args = parser.parse_args()
     try:
-        repack(args.key, args.plain, args.reference, args.output)
+        repack(
+            args.key,
+            args.plain,
+            args.reference,
+            args.output,
+            args.allow_preexisting,
+        )
         return 0
     except ImportError:
         print(

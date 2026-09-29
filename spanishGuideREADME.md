@@ -136,7 +136,7 @@ bash wa-diagnose.sh decrypted.db
 Abre el archivo existente en modo de solo lectura e imprime un informe JSON. El código de salida `0` significa que pasaron las comprobaciones implementadas; `1` indica hallazgos o un error. Lee el informe antes de continuar.
 
 - `integrity` debe contener únicamente `ok`. La corrupción física se trata por separado.
-- `bad_messages` cuenta mensajes sin chat o con tipo NULL, salvo el centinela documentado (`_id=1`, `chat_row_id=-1`, `key_id='-1'`, tipo NULL).
+- `bad_messages` cuenta mensajes sin chat o con tipo NULL, salvo el centinela documentado. El centinela se reconoce por su forma (`chat_row_id=-1`, `key_id='-1'`, tipo NULL), no por su rowid.
 - `orphan_children` cuenta referencias positivas `message_row_id` y `parent_message_row_id` sin mensaje correspondiente.
 - `dangling_chat_pointers` muestra punteros positivos del chat terminados en `_message_row_id` cuyo mensaje no existe.
 - `foreign_key_errors` cuenta violaciones de claves foráneas declaradas. Muchas relaciones de WhatsApp son implícitas, por lo que esto no cubre todas sus relaciones.
@@ -144,6 +144,29 @@ Abre el archivo existente en modo de solo lectura e imprime un informe JSON. El 
 El esquema admitido requiere `message`, `chat` y `message_media`, con claves primarias enteras en `message._id` y `chat._id`. Se rechazan bases que no tengan las tablas o columnas requeridas. Hay pruebas automatizadas con datos sintéticos; no se garantiza compatibilidad con todas las versiones de WhatsApp ni una migración real completada.
 
 Rutas multimedia ausentes, MIME vacío o adjuntos sin descargar no justifican por sí solos borrar mensajes. Estas herramientas no eliminan archivos multimedia.
+
+### Números que parecen catástrofe y no lo son
+
+La contabilidad del multimedia genera cifras grandes y benignas. El informe no las marca, pero las vas a encontrar si consultas la base por tu cuenta:
+
+| Señal | Por qué no es corrupción |
+|---|---|
+| Un mensaje con `message_type` NULL, `chat_row_id` igual a -1 y `key_id` igual a `-1` | Es la fila centinela que WhatsApp escribe en toda base. Las herramientas la conservan. |
+| Filas de multimedia sin `file_path`, o con `transferred = 0` | Multimedia que nunca descargaste, o que borraste del disco. WhatsApp conserva la fila. |
+| Filas con `file_size` en 0, o con `file_size` distinto de `file_length` | En los esquemas actuales `file_size` casi no se usa. El valor real vive en `file_length`. |
+| Filas con `mime_type` vacío | Muchas imágenes enviadas guardan el `mime_type` vacío. |
+
+En la base que dio origen a esta guía, esas cuatro señales sumaban más de 100.000 filas. Ninguna tenía parte en el fallo.
+
+### Archivos rotos en el teléfono
+
+Este caso las herramientas no lo ven, porque vive en el sistema de archivos del teléfono y no en la base. El multimedia de 0 bytes cuelga la transferencia:
+
+```bash
+adb shell 'find /sdcard/Android/media/com.whatsapp/WhatsApp/Media -type f -size 0'
+```
+
+Ignora los `.nomedia`: son marcadores vacíos por diseño. Borra cualquier otro archivo de 0 bytes.
 
 ---
 
@@ -164,7 +187,17 @@ bash wa-diagnose.sh work.db
 
 Usa un nombre de salida nuevo en cada intento. Se rechazan archivos y enlaces simbólicos existentes. La API de respaldo de SQLite incluye cambios confirmados del WAL; no se modifica el original. La limpieza se hace en una transacción sobre una copia temporal privada, verifica el resultado y publica un archivo que solo su propietario puede leer. Un fallo no publica ninguna salida.
 
-**Si un puntero del chat todavía referencia un mensaje seleccionado, la limpieza se detiene.** La herramienta no adivina un reemplazo, no borra el chat ni deja un puntero roto en silencio. Investiga esa relación antes de continuar. Los punteros de chat que ya estuvieran rotos también impiden un resultado exitoso.
+**Si un puntero del chat todavía referencia un mensaje seleccionado, la limpieza se detiene.** La herramienta no adivina un reemplazo, no borra el chat ni deja un puntero roto en silencio. Investiga esa relación antes de continuar.
+
+### Hallazgos que la limpieza nunca repara
+
+Dos hallazgos no tienen reparación segura: los punteros de chat colgados y las violaciones de claves foráneas declaradas. Si tu base ya los traía, la limpieza termina su trabajo y luego se detiene, porque una base con daño inexplicado no es una entrada segura. El error los nombra. Léelos y luego acéptalos de forma consciente:
+
+```bash
+bash wa-clean.sh decrypted.db work.db --allow-preexisting
+```
+
+La bandera acepta solo las cifras que la entrada ya tenía. Si esta ejecución aumenta alguna, la salida se rechaza igual. Los fallos de integridad, los mensajes malos que queden y las filas hijas huérfanas nunca se relajan. Pasa la misma bandera a `wa-repack.sh`, para que acepte la base que produjo la limpieza.
 
 Estas comprobaciones cubren las relaciones descritas, no todas las reglas internas de WhatsApp. Conserva el respaldo cifrado original y la copia del multimedia.
 
@@ -190,14 +223,13 @@ Move to iOS **no** lee el archivo `.crypt15`. Lee la base viva, en `/data/data/c
 
 ### 7a. Conserva una vía de recuperación
 
-**No borres la copia de Google Drive ni los datos ocultos para intentar este procedimiento.** Una comprobación local de cifrado y descifrado no es una prueba de restauración.
+Una comprobación local de cifrado y descifrado no es una prueba de restauración. Copiar los archivos y comparar sus tamaños demuestra que tienes copias. No demuestra que alguna copia restaure en un teléfono.
 
-1. Desactiva temporalmente las copias automáticas de WhatsApp para que un intento fallido no reemplace una copia útil.
-2. Conserva el archivo cifrado original y su clave fuera del teléfono. Comprueba que la copia multimedia terminó, revisa sus archivos y compara cantidades y tamaños con el teléfono antes de borrar datos. Guarda otra copia independiente si es posible.
-3. Omite la búsqueda de respaldos de Google durante la configuración cuando aparezca esa opción. Si tu versión permite desconectar Drive temporalmente sin borrar su copia ni sus datos, puedes usar esa opción reversible.
-4. Si WhatsApp sigue sin ofrecer la copia local, detente. No borres la remota para forzarlo; primero establece un procedimiento de recuperación para esa versión.
+1. Desactiva las copias automáticas de WhatsApp, para que un intento fallido no reemplace una copia útil.
+2. Conserva el archivo cifrado original y su clave fuera del teléfono. Comprueba que la copia multimedia terminó, revisa sus archivos y compara cantidades y tamaños con el teléfono. Guarda otra copia independiente si puedes.
+3. Omite la búsqueda de respaldos de Google durante la configuración cuando aparezca esa opción. WhatsApp no puede leer una copia de Drive que no tiene permiso para buscar.
 
-No ejecutes `pm clear` sin verificar las copias fuera del dispositivo y tener una forma de volver atrás si falla la restauración local.
+No ejecutes `pm clear` hasta verificar las copias fuera del dispositivo, y hasta aceptar que la restauración local puede fallar de todos modos.
 
 ### 7b. Aparta las otras copias del teléfono
 
@@ -237,8 +269,7 @@ Debe mostrar un solo archivo, con el tamaño de tu `msgstore.NEW.crypt15` y due�
 ### 7d. Restaura
 
 En el teléfono:
-
-1. Abre WhatsApp y verifica tu número.
+1. Abre WhatsApp y verifica tu número. Usa el número que hizo la copia.
 2. Cuando pida permiso para buscar copias en tu cuenta de Google, pulsa **Omitir**. Concederlo volvería a vincular Drive.
 3. Si aparece la pantalla de transferir desde el teléfono anterior, recházala con la opción secundaria.
 4. Cuando ofrezca la copia local, pulsa restaurar.
@@ -246,8 +277,22 @@ En el teléfono:
 
 No necesitas restaurar nada a mano. WhatsApp lee el archivo que colocaste.
 
-Si te lleva directo a poner nombre y foto sin ofrecer ninguna copia, no completes nada. Revisa el dueño del archivo y que la carpeta `Databases` tenga un solo `.crypt15`.
+### 7e. Si WhatsApp no ofrece ninguna copia
 
+No completes nada en la pantalla de nombre y foto. Revisa primero estos cinco puntos, porque todos son gratis y reversibles:
+
+1. Revisa el dueño del archivo del paso 7c. WhatsApp no puede leer un archivo cuyo dueño es `shell`.
+2. Revisa que `Databases` tenga exactamente un archivo, tu `.crypt15`. Las copias con fecha y `msgstore-increment.db.crypt15` compiten con él.
+3. Revisa que WhatsApp creara `Android/media/com.whatsapp` por sí mismo después del `pm clear`, antes de que empujaras el archivo. Una carpeta creada por `adb` puede quedar con permisos que WhatsApp no puede usar.
+4. Revisa que el número que verificaste sea el número que hizo la copia.
+5. Revisa que WhatsApp tenga el permiso de archivos y multimedia.
+
+Si los cinco están bien y WhatsApp sigue sin ofrecer nada, hay una cosa más que se sabe que cambia el resultado, y es la única irreversible de esta lista. En el único caso que dio origen a esta guía, la restauración local apareció después de borrar la copia de Drive y desconectar WhatsApp de Drive. Ese es un solo reporte. No está establecido como la causa general.
+
+> **PRECAUCIÓN:** Una copia de Drive no se puede descargar ni inspeccionar, y su borrado no se puede deshacer. Si la restauración local también falla, esa copia ya no vuelve. Decide esto con tus copias de la computadora verificadas delante.
+
+- En la app de Google Drive: menú > **Copias de seguridad** > los tres puntos junto a WhatsApp > **Eliminar copia de seguridad**.
+- Desde `drive.google.com`: engranaje > Configuración > **Administrar aplicaciones** > WhatsApp Messenger > Opciones > **Desconectar de Drive**.
 ---
 
 ## Paso 8: recupera multimedia antes de transferir

@@ -113,11 +113,18 @@ def schema(connection):
     return children, chat_refs
 
 
-# Preserve only the documented sentinel. IS comparisons deliberately handle NULLs.
+# Preserve the sentinel that WhatsApp writes into every database. Match its shape,
+# not its rowid: the row is normally _id=1, but nothing in the schema guarantees that,
+# and deleting it is silent data loss. IS comparisons deliberately handle NULLs.
 BAD_MESSAGE = """
-NOT (m._id = 1 AND m.chat_row_id IS -1 AND m.key_id IS '-1' AND m.message_type IS NULL)
+NOT (m.chat_row_id IS -1 AND m.key_id IS '-1' AND m.message_type IS NULL)
 AND (m.message_type IS NULL OR NOT EXISTS (SELECT 1 FROM chat c WHERE c._id = m.chat_row_id))
 """
+
+# Findings that cleanup never repairs, because no safe replacement value is known.
+# They block by default. They can be accepted knowingly with --allow-preexisting,
+# but only when cleanup did not make them worse.
+UNREPAIRED = ("foreign_key_errors", "dangling_chat_pointers")
 
 
 def scalar(connection, query):
@@ -159,26 +166,87 @@ def report(connection):
     }
 
 
+def findings(result, allow_preexisting=False):
+    """Return only the findings that must stop the run."""
+    problems = {}
+    if result["integrity"] != ["ok"]:
+        problems["integrity"] = result["integrity"]
+    if result["bad_messages"]:
+        problems["bad_messages"] = result["bad_messages"]
+    orphans = {name: n for name, n in result["orphan_children"].items() if n}
+    if orphans:
+        problems["orphan_children"] = orphans
+    if not allow_preexisting:
+        if result["foreign_key_errors"]:
+            problems["foreign_key_errors"] = result["foreign_key_errors"]
+        pointers = {n: c for n, c in result["dangling_chat_pointers"].items() if c}
+        if pointers:
+            problems["dangling_chat_pointers"] = pointers
+    return problems
+
+
 def healthy(result):
-    return (
-        result["integrity"] == ["ok"]
-        and result["foreign_key_errors"] == 0
-        and result["bad_messages"] == 0
-        and not any(result["orphan_children"].values())
-        and not any(result["dangling_chat_pointers"].values())
-    )
+    return not findings(result)
 
 
-def require_integrity(connection):
-    rows = [row[0] for row in connection.execute("PRAGMA integrity_check")]
-    if rows != ["ok"]:
-        raise RecoveryError("SQLite integrity check failed: " + "; ".join(rows[:5]))
+def unrepaired_entries(connection):
+    """Identify each unrepaired finding, not just how many there are.
+
+    Counts alone cannot tell a finding that survived from one that replaced it:
+    a run that repairs one dangling pointer and breaks another leaves the count
+    unchanged. Only the relaxable findings need this, because orphan child rows
+    and bad messages must be zero whatever the caller allows.
+    """
+    _, chat_refs = schema(connection)
+    return {
+        "dangling_chat_pointers": {
+            (ref, chat_id, target)
+            for ref in chat_refs
+            for chat_id, target in connection.execute(
+                f"SELECT _id, {identifier(ref)} FROM chat WHERE {orphan_condition([ref])}"
+            )
+        },
+        "foreign_key_errors": {
+            tuple(row) for row in connection.execute("PRAGMA foreign_key_check")
+        },
+    }
 
 
-def require_healthy(connection):
+def regressions(baseline, result):
+    """Findings this run introduced. These block even with --allow-preexisting."""
+    worse = {}
+    for group in ("dangling_chat_pointers", "foreign_key_errors"):
+        added = result[group] - baseline[group]
+        if added:
+            worse[group] = [list(entry) for entry in sorted(added, key=repr)]
+    return worse
+
+
+def require_integrity(result):
+    if result["integrity"] != ["ok"]:
+        raise RecoveryError(
+            "SQLite integrity check failed: " + "; ".join(result["integrity"][:5])
+        )
+
+
+def require_healthy(connection, allow_preexisting=False, baseline=None):
     result = report(connection)
-    if not healthy(result):
-        raise RecoveryError("Database checks failed: " + json.dumps(result))
+    if baseline is not None:
+        worse = regressions(baseline, unrepaired_entries(connection))
+        if worse:
+            raise RecoveryError(
+                "Cleanup introduced new unrepaired findings; refusing output: "
+                + json.dumps(worse)
+            )
+    problems = findings(result, allow_preexisting)
+    if problems:
+        hint = ""
+        if not allow_preexisting and all(key in UNREPAIRED for key in problems):
+            hint = (
+                " These findings are not repaired by cleanup. If they were already"
+                " present in the input, re-run with --allow-preexisting to accept them."
+            )
+        raise RecoveryError("Database checks failed: " + json.dumps(problems) + hint)
     return result
 
 
@@ -190,7 +258,7 @@ def diagnose(source):
         return 0 if healthy(result) else 1
 
 
-def clean(source, destination=None, dry_run=False):
+def clean(source, destination=None, dry_run=False, allow_preexisting=False):
     source = input_file(source)
     if destination is None and not dry_run:
         raise RecoveryError("An output filename is required unless --dry-run is used")
@@ -201,7 +269,10 @@ def clean(source, destination=None, dry_run=False):
         staged = Path(directory) / "clean.db"
         snapshot(source, staged)
         with closing(sqlite3.connect(staged, isolation_level=None)) as connection:
-            require_integrity(connection)
+            # Record the input state so the checks below can tell a problem that
+            # cleanup introduced from one that was already there.
+            require_integrity(report(connection))
+            baseline = unrepaired_entries(connection)
             children, chat_refs = schema(connection)
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("BEGIN IMMEDIATE")
@@ -241,7 +312,7 @@ def clean(source, destination=None, dry_run=False):
                     connection.execute(
                         f"DELETE FROM {identifier(table)} WHERE {orphan_condition(refs)}"
                     )
-                result = require_healthy(connection)
+                result = require_healthy(connection, allow_preexisting, baseline)
                 if result["messages"] != before - bad:
                     raise RecoveryError(
                         "Unexpected message count after cleanup; refusing output"
@@ -265,9 +336,12 @@ def clean(source, destination=None, dry_run=False):
                     connection.execute("ROLLBACK")
                 raise
             connection.execute("VACUUM")
-            require_healthy(connection)
+            require_healthy(connection, allow_preexisting, baseline)
         publish(staged, destination)
     print(f"Messages: {before} -> {result['messages']} (deleted: {bad})")
+    accepted = {key: result[key] for key in UNREPAIRED if findings(result).get(key)}
+    if accepted:
+        print(f"Accepted pre-existing findings, not repaired: {json.dumps(accepted)}")
     print(f"All database checks passed. Created: {destination}")
 
 
@@ -280,11 +354,18 @@ def main():
     cleanup.add_argument("source")
     cleanup.add_argument("destination", nargs="?")
     cleanup.add_argument("--dry-run", action="store_true")
+    cleanup.add_argument(
+        "--allow-preexisting",
+        action="store_true",
+        help="Accept dangling chat pointers and declared foreign key violations that "
+        "were already present in the input. Cleanup does not repair them. Any "
+        "increase caused by this run still stops the output.",
+    )
     args = parser.parse_args()
     try:
         if args.command == "diagnose":
             return diagnose(args.source)
-        clean(args.source, args.destination, args.dry_run)
+        clean(args.source, args.destination, args.dry_run, args.allow_preexisting)
         return 0
     except (RecoveryError, OSError, sqlite3.Error) as error:
         print(f"ERROR: {error}", file=sys.stderr)

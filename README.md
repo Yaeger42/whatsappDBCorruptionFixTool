@@ -136,7 +136,7 @@ bash wa-diagnose.sh decrypted.db
 This opens the existing file read-only and prints a JSON report. Exit status `0` means the implemented checks passed; `1` means findings or an error, so read the report before continuing.
 
 - `integrity` must contain only `ok`. Physical corruption must be handled separately.
-- `bad_messages` counts missing chats or NULL message types, excluding the documented sentinel (`_id=1`, `chat_row_id=-1`, `key_id='-1'`, NULL type).
+- `bad_messages` counts missing chats or NULL message types, excluding the documented sentinel. The sentinel is recognized by its shape (`chat_row_id=-1`, `key_id='-1'`, NULL type), not by its rowid.
 - `orphan_children` counts positive `message_row_id` and `parent_message_row_id` references with no matching message.
 - `dangling_chat_pointers` reports positive chat pointers ending in `_message_row_id` that have no target.
 - `foreign_key_errors` reports violations of declared foreign keys. Many WhatsApp relationships are implicit, so this is not a complete relationship check.
@@ -144,6 +144,29 @@ This opens the existing file read-only and prints a JSON report. Exit status `0`
 The supported schema requires `message`, `chat`, and `message_media`, with integer primary keys on `message._id` and `chat._id`. Databases missing the required tables or columns are rejected. The tools have automated synthetic tests, but no claim of compatibility with every WhatsApp version or a completed device migration.
 
 Missing media paths, empty MIME types, or undownloaded attachments are not by themselves reasons to delete a message. These tools do not remove media files.
+
+### Counts that look alarming and are not
+
+Media bookkeeping produces large benign numbers. The report does not flag them, but you will meet them if you query the database yourself:
+
+| Signal | Why this is not corruption |
+|---|---|
+| One message with a NULL `message_type`, `chat_row_id` of -1, and `key_id` of `-1` | The sentinel row that WhatsApp writes into every database. The tools preserve it. |
+| Media rows with no `file_path`, or with `transferred = 0` | Media that you never downloaded, or that you deleted from disk. WhatsApp keeps the row. |
+| Media rows with `file_size` of 0, or with `file_size` different from `file_length` | Current schemas barely use `file_size`. The real value is in `file_length`. |
+| Media rows with an empty `mime_type` | Many sent images store an empty `mime_type`. |
+
+In the database behind this guide those four signals covered more than 100,000 rows. None of them had a part in the failure.
+
+### Broken files on the phone
+
+These tools cannot see this one, because it lives on the phone filesystem instead of the database. Zero-byte media stalls the transfer:
+
+```bash
+adb shell 'find /sdcard/Android/media/com.whatsapp/WhatsApp/Media -type f -size 0'
+```
+
+Ignore the `.nomedia` files: they are empty markers by design. Delete any other zero-byte file.
 
 ---
 
@@ -164,7 +187,17 @@ bash wa-diagnose.sh work.db
 
 Use a new output filename on each attempt. Existing files and symlinks are rejected. The SQLite backup API includes committed WAL contents; the original is not edited. Cleanup runs in a transaction on a private temporary copy, checks its results, then publishes a file with owner-only permissions. A failed run publishes no output.
 
-**If a selected message is still referenced by a chat pointer, cleanup stops.** The tool does not guess a replacement message, delete the chat, or silently leave a dangling pointer. Investigate that schema and relationship before proceeding. Pre-existing dangling chat pointers also prevent a successful result.
+**If a selected message is still referenced by a chat pointer, cleanup stops.** The tool does not guess a replacement message, delete the chat, or silently leave a dangling pointer. Investigate that schema and relationship before proceeding.
+
+### Findings that cleanup never repairs
+
+Two findings have no safe repair: dangling chat pointers and violations of declared foreign keys. When your input already carries them, cleanup completes its own work and then stops, because a database with unexplained damage is not a safe input. The error names the findings. Read them, then accept them knowingly:
+
+```bash
+bash wa-clean.sh decrypted.db work.db --allow-preexisting
+```
+
+The flag accepts only the counts that the input already had. If this run increases any of them, the output is still refused. Integrity failures, remaining bad messages, and orphan child rows are never relaxed. Pass the same flag to `wa-repack.sh`, so that it accepts the database that cleanup produced.
 
 Successful checks cover the relationships listed above, not every possible WhatsApp invariant. Keep the original encrypted backup and your media copy.
 
@@ -190,14 +223,13 @@ Move to iOS does **not** read the `.crypt15` file. It reads the live database, a
 
 ### 7a. Keep a recovery path
 
-**Do not delete the Google Drive backup or hidden app data to try this procedure.** A local round trip is not a restore test.
+A local round trip is not a restore test. Copying the files and comparing their sizes proves that you have copies. It does not prove that any copy restores on a phone.
 
-1. Turn off automatic WhatsApp backups temporarily so a failed attempt cannot replace a useful backup.
-2. Keep the original encrypted file and key off the phone. Confirm the media copy completed, inspect its files, and compare file counts and sizes with the phone before clearing app data. Keep a second independent copy if possible.
-3. During setup, skip the Google account backup search when that option is offered. If your version offers a reversible way to disconnect Drive without deleting its backup or data, that can be used temporarily.
-4. If WhatsApp still will not offer the local backup, stop. Do not delete the remote backup to force it; first establish a recovery procedure for that app version.
+1. Turn off automatic WhatsApp backups, so that a failed attempt cannot replace a useful backup.
+2. Keep the original encrypted file and the key off the phone. Confirm that the media copy completed, inspect its files, and compare file counts and sizes against the phone. Keep a second independent copy if you can.
+3. During setup, skip the Google account backup search when that option is offered. WhatsApp cannot read a Drive backup that it has no permission to search.
 
-Do not continue to `pm clear` unless you have verified the off-device copies and have a way back if the local restore fails.
+Do not continue to `pm clear` until the off-device copies are verified, and until you accept that the local restore can still fail.
 
 ### 7b. Move the Other Backups Aside
 
@@ -238,7 +270,7 @@ The output must show one file, with the size of your `msgstore.NEW.crypt15` and 
 
 On the phone:
 
-1. Open WhatsApp and verify your phone number.
+1. Open WhatsApp and verify your phone number. Use the number that made the backup.
 2. When WhatsApp asks for permission to search your Google account for backups, tap **Skip**. Permission links Drive again.
 3. If the screen about a transfer from your old phone appears, decline it with the secondary option.
 4. When WhatsApp offers the local backup, tap restore.
@@ -246,7 +278,22 @@ On the phone:
 
 You restore nothing by hand. WhatsApp reads the file that you put in place.
 
-If WhatsApp takes you straight to the name and photo screen with no backup offer, complete nothing. Check the file owner, and check that the `Databases` folder holds one `.crypt15` file only.
+### 7e. If WhatsApp offers no backup
+
+Complete nothing on the name and photo screen. Work through these first, because all five are free and reversible:
+
+1. Check the file owner from step 7c. WhatsApp cannot read a file owned by `shell`.
+2. Check that `Databases` holds exactly one file, your `.crypt15`. Dated copies and `msgstore-increment.db.crypt15` compete with it.
+3. Check that WhatsApp created `Android/media/com.whatsapp` itself after `pm clear`, before you pushed the file. A folder created by `adb` can carry ownership that WhatsApp cannot use.
+4. Check that the number you verified is the number that made the backup.
+5. Check that WhatsApp holds the files and media permission.
+
+If all five hold and WhatsApp still offers nothing, one more thing is known to change the outcome, and it is the only irreversible item here. In the single case behind this guide, the local restore appeared after the Drive backup was deleted and WhatsApp was disconnected from Drive. That is one report. It is not established as the general cause.
+
+> **CAUTION:** A Drive backup cannot be downloaded or inspected, and deleting it cannot be undone. If the local restore then fails as well, that copy is gone. Decide this with your verified computer copies in front of you.
+
+- In the Google Drive app: menu > **Backups** > the three-dot menu next to WhatsApp > **Delete backup**.
+- From `drive.google.com`: gear > Settings > **Manage apps** > WhatsApp Messenger > Options > **Disconnect from Drive**.
 
 ---
 
