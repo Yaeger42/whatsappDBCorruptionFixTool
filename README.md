@@ -1,5 +1,3 @@
-# whatsapp DB Corruption Fix-Tool
-This is a comprehensive guide on how to use a set of tools for allowing the migration of android to whatsapp when the progress bar gets stuck at a certain percentage (like 47%) and no matter what you do it just won't move
 # How to Fix the Move to iOS Error When You Transfer WhatsApp from Android to iPhone
 
 This guide solves one specific case: **Move to iOS always fails at the same percentage** during the WhatsApp transfer, and shows *"An unknown error occurred. Please try again later."*
