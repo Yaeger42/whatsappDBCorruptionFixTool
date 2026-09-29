@@ -1,0 +1,2 @@
+# Pin the header-preserving crypt15 APIs used by wa_repack.py.
+wa-crypt-tools @ git+https://github.com/ElDavoo/wa-crypt-tools.git@e2c0282be6769898de7abd95c3f6208f11822f83
