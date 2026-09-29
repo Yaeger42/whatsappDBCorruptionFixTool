@@ -153,6 +153,72 @@ class RecoveryTests(DatabaseFixture):
         self.assert_refused(
             "UPDATE chat SET display_message_row_id=999;", "Database checks failed"
         )
+        
+    def test_sentinel_with_other_rowid_is_preserved(self):
+    # Nothing in the schema pins the sentinel to _id=1.
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.executescript("UPDATE message SET _id=5 WHERE _id=1;")
+        result = self.run_tool("wa-clean.sh", self.source, self.output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(rows(self.output, "SELECT _id FROM message"), [(2,), (5,)])
+
+    def test_allow_preexisting_publishes_without_repairing(self):
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.executescript(
+                "UPDATE chat SET display_message_row_id=999;"
+                "CREATE TABLE dependent(chat_id REFERENCES chat(_id));"
+                "INSERT INTO dependent VALUES(999);"
+            )
+        before = digest(self.source)
+        refused = self.run_tool("wa-clean.sh", self.source, self.output)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("--allow-preexisting", refused.stderr)
+        self.assertFalse(self.output.exists())
+        result = self.run_tool(
+            "wa-clean.sh", self.source, self.output, "--allow-preexisting"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Accepted pre-existing findings", result.stdout)
+        self.assertEqual(rows(self.output, "SELECT _id FROM message"), [(1,), (2,)])
+        self.assertEqual(
+            rows(self.output, "SELECT display_message_row_id FROM chat"), [(999,)]
+        )
+        self.assertEqual(digest(self.source), before)
+    
+    def test_allow_preexisting_does_not_relax_integrity(self):
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.executescript(
+                "CREATE TABLE checked(n INTEGER CHECK(n>0));"
+                "PRAGMA ignore_check_constraints=ON;"
+                "INSERT INTO checked VALUES(-1);"
+            )
+        result = self.run_tool(
+            "wa-clean.sh", self.source, self.output, "--allow-preexisting"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("integrity check failed", result.stderr)
+        self.assertFalse(self.output.exists())
+    
+    def test_regression_in_unrepaired_counters_blocks_output(self):
+        baseline = {
+            "integrity": ["ok"],
+            "foreign_key_errors": 1,
+            "orphan_children": {"message_media": 0},
+            "dangling_chat_pointers": {"last_message_row_id": 1},
+        }
+        worse = dict(baseline, foreign_key_errors=2)
+        self.assertEqual(
+            wa_db.regressions(baseline, worse), {"foreign_key_errors": [1, 2]}
+        )
+        self.assertEqual(wa_db.regressions(baseline, baseline), {})
+        # An accepted pre-existing count is not a regression, a new one is.
+        self.assertEqual(
+            wa_db.regressions(
+                baseline, dict(baseline, orphan_children={"message_media": 3})
+            ),
+            {"orphan_children": {"message_media": [0, 3]}},
+        )
+
 
     def test_integrity_failure_is_not_success(self):
         self.assert_refused(
@@ -357,6 +423,35 @@ class RepackTests(DatabaseFixture):
         self.assertIn("Database checks failed", result.stderr)
         self.assertFalse(self.output.exists())
         self.assertEqual(list(self.directory.glob(".wa-*")), [])
+        
+    def test_repack_matches_the_cleanup_decision_on_preexisting_findings(self):
+        with closing(sqlite3.connect(self.source)) as connection:
+            connection.executescript("UPDATE chat SET display_message_row_id=999;")
+        relaxed = self.directory / "relaxed.db"
+        self.assertEqual(
+            self.run_tool(
+                "wa-clean.sh", self.source, relaxed, "--allow-preexisting"
+            ).returncode,
+            0,
+        )
+        output = self.directory / "relaxed.crypt15"
+        refused = self.run_tool(
+            "wa-repack.sh", self.key_path, relaxed, self.reference, output
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("Database checks failed", refused.stderr)
+        self.assertFalse(output.exists())
+        result = self.run_tool(
+            "wa-repack.sh",
+            self.key_path,
+            relaxed,
+            self.reference,
+            output,
+            "--allow-preexisting",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(output.exists())
+
 
     def test_failed_roundtrip_is_not_published(self):
         # Damage the newly written encrypted file as the verifier opens it.
