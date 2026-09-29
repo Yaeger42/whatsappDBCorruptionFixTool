@@ -362,4 +362,4 @@ Run the regression suite after installing `requirements.txt`:
 python3 -m unittest discover -s tests -v
 ```
 
-Tests generate disposable databases and keys. They cover output collisions, failed cleanup, WAL snapshots, chat-pointer refusal, integrity checks, and authenticated crypt15 round trips with fresh IVs and preserved metadata. CI runs on Linux and macOS with Python 3.10 and 3.14. Device restore testing remains a separate step.
+Tests generate disposable databases and keys. They cover output collisions, failed cleanup, WAL snapshots, chat-pointer refusal, integrity checks, and authenticated crypt15 round trips with fresh IVs and preserved metadata. Run them locally with the command above. Device restore testing remains a separate step.
